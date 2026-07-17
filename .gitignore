@@ -1,0 +1,21 @@
+__pycache__/
+*.py[cod]
+.DS_Store
+.pytest_cache/
+.venv/
+dist/
+build/
+*.egg-info/
+
+# Local email sources and generated exports may contain confidential data.
+*.pst
+*.ost
+*.mbox
+*.mbx
+*.eml
+emails.jsonl
+errors.jsonl
+manifest.json
+attachments/
+markdown/
+eml/
