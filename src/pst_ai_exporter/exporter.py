@@ -163,6 +163,48 @@ def _sha256_file(path: Path) -> str:
     return digest.hexdigest()
 
 
+def _replace_unicode_surrogates(value: str) -> tuple[str, int]:
+    """Replace non-serializable surrogate code points with U+FFFD."""
+    replacements = sum(0xD800 <= ord(character) <= 0xDFFF for character in value)
+    if not replacements:
+        return value, 0
+    return "".join(
+        "\N{REPLACEMENT CHARACTER}"
+        if 0xD800 <= ord(character) <= 0xDFFF
+        else character
+        for character in value
+    ), replacements
+
+
+def _sanitize_record_value(value: object) -> tuple[object, int]:
+    """Make JSON-bound record values valid UTF-8 and report replacements."""
+    if isinstance(value, str):
+        return _replace_unicode_surrogates(value)
+    if isinstance(value, list):
+        sanitized_items: list[object] = []
+        replacements = 0
+        for item in value:
+            sanitized, item_replacements = _sanitize_record_value(item)
+            sanitized_items.append(sanitized)
+            replacements += item_replacements
+        return sanitized_items, replacements
+    if isinstance(value, dict):
+        sanitized_mapping: dict[object, object] = {}
+        replacements = 0
+        for key, item in value.items():
+            sanitized_key, key_replacements = _sanitize_record_value(key)
+            sanitized_item, item_replacements = _sanitize_record_value(item)
+            sanitized_mapping[sanitized_key] = sanitized_item
+            replacements += key_replacements + item_replacements
+        return sanitized_mapping, replacements
+    return value, 0
+
+
+def _is_appledouble_sidecar(path: Path) -> bool:
+    """Return whether a path is a macOS AppleDouble metadata sidecar."""
+    return any(part.startswith("._") for part in path.parts)
+
+
 def _clean_text(value: str) -> str:
     value = value.replace("\r\n", "\n").replace("\r", "\n")
     value = "\n".join(line.rstrip() for line in value.split("\n"))
@@ -270,7 +312,8 @@ def _reference_ids(message: Message) -> list[str]:
 
 
 def _safe_filename(name: str, fallback: str) -> str:
-    value = unicodedata.normalize("NFKC", name or fallback)
+    value, _replacements = _replace_unicode_surrogates(name or fallback)
+    value = unicodedata.normalize("NFKC", value)
     value = value.replace("/", "_").replace("\\", "_").replace("\x00", "")
     value = "".join(char for char in value if unicodedata.category(char) != "Cc")
     value = re.sub(r"\s+", " ", value).strip(" .")
@@ -367,7 +410,7 @@ def _message_record(
         {"name": str(name), "value": str(value)}
         for name, value in message.raw_items()
     ]
-    return {
+    record: dict[str, object] = {
         "schema_version": SCHEMA_VERSION,
         "id": email_id,
         "content_sha256": _sha256_bytes(raw),
@@ -391,7 +434,19 @@ def _message_record(
         "body": body,
         "attachments": attachment_records,
         "headers": headers,
+        "warnings": [],
     }
+    sanitized_record, replacements = _sanitize_record_value(record)
+    assert isinstance(sanitized_record, dict)
+    if replacements:
+        sanitized_record["warnings"] = [
+            {
+                "type": "invalid_unicode_replaced",
+                "replacement_count": replacements,
+                "replacement_character": "U+FFFD",
+            }
+        ]
+    return sanitized_record
 
 
 def _json_value(value: object) -> str:
@@ -539,6 +594,8 @@ def _expand_sources(sources: Sequence[Path], output_dir: Path) -> list[_SourceSp
         resolved = path.resolve()
         if resolved in seen_files:
             return
+        if _is_appledouble_sidecar(path):
+            return
         suffix = path.suffix.lower()
         if suffix in archive_types:
             specs.append(_source_spec(path, archive_types[suffix]))
@@ -570,6 +627,7 @@ def _expand_sources(sources: Sequence[Path], output_dir: Path) -> list[_SourceSp
                 path
                 for path in source.rglob("*")
                 if path.is_file()
+                and not _is_appledouble_sidecar(path.relative_to(source))
                 and path.suffix.lower() in {*archive_types, ".eml"}
                 and not path.resolve().is_relative_to(output_resolved)
             ),
@@ -588,6 +646,12 @@ def _expand_sources(sources: Sequence[Path], output_dir: Path) -> list[_SourceSp
             seen_files.update(path.resolve() for path in eml_files)
         if not archive_files and not eml_files:
             raise ExportError(f"No PST, MBOX, or EML files were found in {source}.")
+
+    if not specs:
+        raise ExportError(
+            "No usable PST, MBOX, or EML sources were found. "
+            "macOS AppleDouble files beginning with '._' are metadata and are excluded."
+        )
 
     managed_roots = [(output_resolved / name).resolve() for name in MANAGED_OUTPUTS]
     for spec in specs:
@@ -688,6 +752,8 @@ def export_sources(
     messages_found = 0
     attachment_count = 0
     attachment_bytes = 0
+    messages_with_unicode_replacements = 0
+    unicode_replacement_characters = 0
     date_values: list[str] = []
 
     jsonl_stream = None
@@ -723,6 +789,17 @@ def export_sources(
                                 output_dir,
                                 options.include_html,
                             )
+                            warnings = record.get("warnings", [])
+                            if isinstance(warnings, list):
+                                for warning in warnings:
+                                    if (
+                                        isinstance(warning, dict)
+                                        and warning.get("type") == "invalid_unicode_replaced"
+                                    ):
+                                        messages_with_unicode_replacements += 1
+                                        unicode_replacement_characters += int(
+                                            warning.get("replacement_count", 0)
+                                        )
                             content_hash = str(record["content_sha256"])
                             record["duplicate_of"] = first_content_ids.get(content_hash)
 
@@ -863,6 +940,8 @@ def export_sources(
             "exact_duplicate_messages": message_count - len(first_content_ids),
             "attachments": attachment_count,
             "attachment_bytes": attachment_bytes,
+            "messages_with_unicode_replacements": messages_with_unicode_replacements,
+            "unicode_replacement_characters": unicode_replacement_characters,
         },
         "date_range_utc": {
             "earliest": min(date_values) if date_values else None,

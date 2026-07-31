@@ -14,6 +14,13 @@ thread references, the original headers, source archive, folder location, clean
 text, optional HTML, attachment metadata, and SHA-256 hashes. It does not upload
 mail or call an AI service.
 
+Files beginning with `._` are macOS AppleDouble metadata sidecars and are ignored
+when archives copied from a Mac are processed on Windows or Linux. If malformed
+text contains non-serializable Unicode surrogate code points, the exporter keeps
+the message, replaces only those code points with `U+FFFD`, and records a warning
+on the message plus aggregate replacement counts in `manifest.json`. The
+`content_sha256` remains the hash of the unmodified raw message bytes.
+
 ## Privacy
 
 Email processing stays local. Source archives, individual EML files, and generated
@@ -43,6 +50,44 @@ sudo apt install pst-utils
 ```
 
 MBOX and EML sources can be exported without `readpst`.
+
+## Windows with WSL
+
+PST processing on Windows is supported through Ubuntu in WSL. Keep the evidence
+under a Windows path such as `C:\USC-Uber`; Ubuntu sees that folder at
+`/mnt/c/USC-Uber`.
+
+Install the required packages in Ubuntu:
+
+```bash
+sudo apt update
+sudo apt install -y git python3 python3-venv pst-utils
+```
+
+Clone and install the exporter:
+
+```bash
+mkdir -p /mnt/c/USC-Uber/tools
+cd /mnt/c/USC-Uber/tools
+git clone https://github.com/michael-savo/pst-ai-exporter.git
+cd pst-ai-exporter
+python3 -m venv .venv
+source .venv/bin/activate
+python -m pip install -e .
+```
+
+For a machine with 24 CPU cores, start with 16 extraction jobs so Windows and
+the storage device retain capacity for filesystem work:
+
+```bash
+pst-ai-exporter \
+  "/mnt/c/USC-Uber/input/Ed Telmany" \
+  --output "/mnt/c/USC-Uber/output/Ed_Telmany_Complete_v2" \
+  --jobs 16
+```
+
+Choose a new output directory for every evidentiary run. Do not use
+`--overwrite` on a preserved export.
 
 ## Easiest use on macOS
 
@@ -107,6 +152,7 @@ Each line in `emails.jsonl` is a standalone JSON object:
   "id": "stable-message-id",
   "content_sha256": "hash-of-original-eml",
   "duplicate_of": null,
+  "warnings": [],
   "source": {
     "id": "source-id",
     "type": "pst",

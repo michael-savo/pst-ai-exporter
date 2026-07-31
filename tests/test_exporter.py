@@ -297,6 +297,75 @@ class ExporterTests(unittest.TestCase):
                 {"mbox", "eml_directory"},
             )
 
+    def test_ignores_macos_appledouble_sidecars(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source = root / "copied-from-mac"
+            source.mkdir()
+            raw = self._sample_message().as_bytes()
+            (source / "message.eml").write_bytes(raw)
+            (source / "._message.eml").write_bytes(b"AppleDouble metadata")
+            hidden_directory = source / "._metadata"
+            hidden_directory.mkdir()
+            (hidden_directory / "other.eml").write_bytes(b"AppleDouble metadata")
+
+            output = root / "export"
+            manifest = export_source(source, output)
+            records = [
+                json.loads(line)
+                for line in (output / "emails.jsonl").read_text(encoding="utf-8").splitlines()
+            ]
+
+            self.assertEqual(manifest["counts"]["sources"], 1)
+            self.assertEqual(manifest["counts"]["messages_exported"], 1)
+            self.assertEqual(records[0]["subject"], "Quarterly project update")
+
+    def test_rejects_explicit_appledouble_sidecar_as_only_source(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            sidecar = root / "._archive.pst"
+            sidecar.write_bytes(b"AppleDouble metadata")
+
+            with self.assertRaisesRegex(ExportError, "AppleDouble"):
+                export_source(sidecar, root / "export")
+
+    def test_replaces_invalid_unicode_without_omitting_message(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source = root / "message.eml"
+            source.write_bytes(self._sample_message().as_bytes())
+            parsed_message = self._sample_message()
+            original_raw_items = parsed_message.raw_items
+
+            def raw_items_with_surrogate():
+                yield from original_raw_items()
+                yield "X-Damaged-Text", "invalid-\udce0-value"
+
+            parsed_message.raw_items = raw_items_with_surrogate  # type: ignore[method-assign]
+
+            with patch(
+                "pst_ai_exporter.exporter.BytesParser.parsebytes",
+                return_value=parsed_message,
+            ):
+                manifest = export_source(source, root / "export")
+
+            record = json.loads(
+                (root / "export" / "emails.jsonl").read_text(encoding="utf-8")
+            )
+            repaired_header = next(
+                item for item in record["headers"] if item["name"] == "X-Damaged-Text"
+            )
+
+            self.assertEqual(manifest["status"], "complete")
+            self.assertEqual(manifest["counts"]["messages_failed"], 0)
+            self.assertEqual(
+                manifest["counts"]["messages_with_unicode_replacements"], 1
+            )
+            self.assertEqual(manifest["counts"]["unicode_replacement_characters"], 1)
+            self.assertEqual(repaired_header["value"], "invalid-\N{REPLACEMENT CHARACTER}-value")
+            self.assertEqual(record["warnings"][0]["type"], "invalid_unicode_replaced")
+            self.assertEqual(record["warnings"][0]["replacement_count"], 1)
+
 
 if __name__ == "__main__":
     unittest.main()
