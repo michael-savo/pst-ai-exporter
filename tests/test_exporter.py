@@ -12,6 +12,7 @@ from unittest.mock import patch
 from pst_ai_exporter.exporter import (
     ExportError,
     ExportOptions,
+    _extract_pst,
     export_source,
     export_sources,
     html_to_text,
@@ -48,6 +49,57 @@ class ExporterTests(unittest.TestCase):
             filename="report.txt",
         )
         return message
+
+    def _libpst_calendar_message(
+        self,
+        boundary: str,
+        dtstamp: str,
+        generated_filename: str,
+        include_inline_part: bool = True,
+    ) -> bytes:
+        calendar = (
+            "BEGIN:VCALENDAR\n"
+            "VERSION:2.0\n"
+            "PRODID:LibPST v0.6.76\n"
+            "METHOD:REQUEST\n"
+            "BEGIN:VEVENT\n"
+            "UID:0x1234\n"
+            f"DTSTAMP:{dtstamp}\n"
+            "DTSTART;VALUE=DATE-TIME:20250715T183000Z\n"
+            "DTEND;VALUE=DATE-TIME:20250715T190000Z\n"
+            "SUMMARY:Evidence review\n"
+            "END:VEVENT\n"
+            "END:VCALENDAR\n"
+        )
+        inline_part = (
+            f"--{boundary}\n"
+            'Content-Type: text/calendar; charset="utf-8"\n'
+            "\n"
+            f"{calendar}"
+            if include_inline_part
+            else ""
+        )
+        return (
+            "From: Alice Example <alice@example.com>\n"
+            "To: Bob Example <bob@example.com>\n"
+            "Subject: Calendar test\n"
+            "Date: Tue, 15 Jul 2025 14:30:00 -0400\n"
+            "Message-ID: <calendar-test@example.com>\n"
+            "MIME-Version: 1.0\n"
+            f'Content-Type: multipart/mixed; boundary="{boundary}"\n'
+            "\n"
+            f"--{boundary}\n"
+            'Content-Type: text/plain; charset="utf-8"\n'
+            "\n"
+            "Calendar invitation attached.\n"
+            f"{inline_part}"
+            f"--{boundary}\n"
+            f'Content-Type: text/calendar; charset="utf-8"; name="{generated_filename}"\n'
+            f'Content-Disposition: attachment; filename="{generated_filename}"\n'
+            "\n"
+            f"{calendar}"
+            f"--{boundary}--\n"
+        ).encode("utf-8")
 
     def test_exports_jsonl_markdown_headers_and_attachments(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -267,6 +319,195 @@ class ExporterTests(unittest.TestCase):
                 {"vault-part-1.pst", "vault-part-2.pst"},
             )
             self.assertTrue(all(record["source"]["type"] == "pst" for record in records))
+
+    def test_readpst_is_forced_to_true_serial_mode(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            pst_path = root / "archive.pst"
+            destination = root / "readpst-output"
+            pst_path.write_bytes(b"PST placeholder")
+            destination.mkdir()
+
+            completed = type(
+                "Completed",
+                (),
+                {"returncode": 0, "stdout": "", "stderr": ""},
+            )()
+            with patch(
+                "pst_ai_exporter.exporter.shutil.which",
+                return_value="/usr/bin/readpst",
+            ), patch(
+                "pst_ai_exporter.exporter.subprocess.run",
+                return_value=completed,
+            ) as run:
+                _extract_pst(
+                    pst_path,
+                    destination,
+                    ExportOptions(jobs=0),
+                    lambda _message: None,
+                )
+
+            command = run.call_args.args[0]
+            self.assertEqual(
+                command[:8],
+                ["/usr/bin/readpst", "-e", "-8", "-q", "-t", "e", "-j", "0"],
+            )
+
+    def test_rejects_unsafe_readpst_parallelism(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source = root / "message.eml"
+            source.write_bytes(self._sample_message().as_bytes())
+
+            with self.assertRaisesRegex(ExportError, "Unsafe ReadPST parallelism"):
+                export_source(source, root / "export", ExportOptions(jobs=1))
+
+    def test_source_and_message_ids_are_stable_across_computers(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            raw = self._sample_message().as_bytes()
+            records = []
+
+            for computer in ("computer-a", "computer-b"):
+                source = root / computer / "same-message.eml"
+                source.parent.mkdir()
+                source.write_bytes(raw)
+                output = root / f"{computer}-output"
+                export_source(source, output)
+                records.append(
+                    json.loads((output / "emails.jsonl").read_text(encoding="utf-8"))
+                )
+
+            self.assertEqual(records[0]["source"]["id"], records[1]["source"]["id"])
+            self.assertEqual(records[0]["id"], records[1]["id"])
+            self.assertEqual(
+                records[0]["semantic_sha256"], records[1]["semantic_sha256"]
+            )
+
+    def test_libpst_calendar_artifacts_have_stable_semantic_identity(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            pst_path = root / "calendar.pst"
+            pst_path.write_bytes(b"stable PST evidence")
+            raw_messages = iter(
+                [
+                    self._libpst_calendar_message(
+                        "boundary-run-one", "20260803T120000Z", "i111111.ics"
+                    ),
+                    self._libpst_calendar_message(
+                        "boundary-run-two", "20260803T130000Z", "i222222.ics"
+                    ),
+                ]
+            )
+
+            def fake_extract(_pst_path, destination, _options, _progress):
+                inbox = destination / "Personal folders" / "Inbox"
+                inbox.mkdir(parents=True)
+                (inbox / "1.eml").write_bytes(next(raw_messages))
+
+            records = []
+            manifests = []
+            with patch(
+                "pst_ai_exporter.exporter._readpst_executable",
+                return_value="/usr/bin/readpst",
+            ), patch(
+                "pst_ai_exporter.exporter._readpst_version_output",
+                return_value="ReadPST / LibPST v0.6.76",
+            ), patch(
+                "pst_ai_exporter.exporter._extract_pst",
+                side_effect=fake_extract,
+            ):
+                for run_number in (1, 2):
+                    output = root / f"run-{run_number}"
+                    manifests.append(export_source(pst_path, output))
+                    records.append(
+                        json.loads(
+                            (output / "emails.jsonl").read_text(encoding="utf-8")
+                        )
+                    )
+
+            first, second = records
+            self.assertEqual(first["id"], second["id"])
+            self.assertNotEqual(first["content_sha256"], second["content_sha256"])
+            self.assertEqual(first["semantic_sha256"], second["semantic_sha256"])
+            self.assertEqual(
+                [item["semantic_sha256"] for item in first["attachments"]],
+                [item["semantic_sha256"] for item in second["attachments"]],
+            )
+            self.assertNotEqual(
+                [item["sha256"] for item in first["attachments"]],
+                [item["sha256"] for item in second["attachments"]],
+            )
+            self.assertEqual(
+                manifests[0]["counts"]["attachments_with_semantic_normalization"],
+                2,
+            )
+            self.assertEqual(manifests[0]["pst_reader"]["parallel_jobs"], 0)
+
+    def test_unpaired_calendar_attachment_is_not_normalized(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source = root / "attached-calendar.eml"
+            source.write_bytes(
+                self._libpst_calendar_message(
+                    "original-boundary",
+                    "20250715T183000Z",
+                    "i111111.ics",
+                    include_inline_part=False,
+                )
+            )
+
+            export_source(source, root / "export")
+            record = json.loads(
+                (root / "export" / "emails.jsonl").read_text(encoding="utf-8")
+            )
+            self.assertEqual(len(record["attachments"]), 1)
+            attachment = record["attachments"][0]
+            self.assertIsNone(attachment["semantic_normalization"])
+            self.assertEqual(attachment["semantic_sha256"], attachment["sha256"])
+
+    def test_semantic_duplicates_survive_libpst_randomization(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            first_pst = root / "part-one.pst"
+            second_pst = root / "part-two.pst"
+            first_pst.write_bytes(b"first PST")
+            second_pst.write_bytes(b"second PST")
+
+            def fake_extract(pst_path, destination, _options, _progress):
+                inbox = destination / "Personal folders" / "Inbox"
+                inbox.mkdir(parents=True)
+                if pst_path == first_pst:
+                    raw = self._libpst_calendar_message(
+                        "boundary-one", "20260803T120000Z", "i111111.ics"
+                    )
+                else:
+                    raw = self._libpst_calendar_message(
+                        "boundary-two", "20260803T130000Z", "i222222.ics"
+                    )
+                (inbox / "1.eml").write_bytes(raw)
+
+            output = root / "combined"
+            with patch(
+                "pst_ai_exporter.exporter._readpst_executable",
+                return_value="/usr/bin/readpst",
+            ), patch(
+                "pst_ai_exporter.exporter._readpst_version_output",
+                return_value="ReadPST / LibPST v0.6.76",
+            ), patch(
+                "pst_ai_exporter.exporter._extract_pst",
+                side_effect=fake_extract,
+            ):
+                manifest = export_sources([first_pst, second_pst], output)
+
+            records = [
+                json.loads(line)
+                for line in (output / "emails.jsonl").read_text(encoding="utf-8").splitlines()
+            ]
+            self.assertEqual(manifest["counts"]["unique_message_content"], 1)
+            self.assertEqual(manifest["counts"]["exact_duplicate_messages"], 1)
+            self.assertIsNone(records[0]["duplicate_of"])
+            self.assertEqual(records[1]["duplicate_of"], records[0]["id"])
 
     def test_discovers_mixed_sources_in_a_folder(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

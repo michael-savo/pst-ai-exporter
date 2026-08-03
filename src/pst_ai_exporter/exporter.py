@@ -24,7 +24,7 @@ from urllib.parse import quote
 from . import __version__
 
 
-SCHEMA_VERSION = "1.1"
+SCHEMA_VERSION = "1.2"
 MANAGED_OUTPUTS = (
     "manifest.json",
     "emails.jsonl",
@@ -45,7 +45,7 @@ class ExportOptions:
     include_html: bool = False
     keep_eml: bool = False
     include_deleted: bool = False
-    jobs: int | None = None
+    jobs: int = 0
     overwrite: bool = False
     strict: bool = False
 
@@ -55,6 +55,7 @@ class _SourceSpec:
     path: Path
     source_type: str
     source_id: str
+    source_sha256: str | None = None
     eml_files: tuple[Path, ...] = ()
 
 
@@ -143,14 +144,12 @@ def _sha256_bytes(value: bytes) -> str:
     return hashlib.sha256(value).hexdigest()
 
 
-def _email_id(raw: bytes, relative_path: Path, source_id: str = "") -> str:
+def _email_id(relative_path: Path, source_id: str = "") -> str:
     relative_posix = relative_path.as_posix()
     identity = (
         source_id.encode("ascii")
         + b"\0"
         + relative_posix.encode("utf-8", errors="surrogateescape")
-        + b"\0"
-        + raw
     )
     return hashlib.sha256(identity).hexdigest()[:24]
 
@@ -161,6 +160,38 @@ def _sha256_file(path: Path) -> str:
         for chunk in iter(lambda: stream.read(1024 * 1024), b""):
             digest.update(chunk)
     return digest.hexdigest()
+
+
+def _canonical_sha256(value: object) -> str:
+    encoded = json.dumps(
+        value,
+        ensure_ascii=True,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("ascii")
+    return _sha256_bytes(encoded)
+
+
+def _normalize_libpst_calendar(content: bytes) -> tuple[bytes, list[str]]:
+    """Remove only conversion-time artifacts from LibPST-generated calendars."""
+    try:
+        text = content.decode("utf-8-sig")
+    except UnicodeDecodeError:
+        return content, []
+
+    normalized = text.replace("\r\n", "\n").replace("\r", "\n")
+    if not re.search(r"(?mi)^PRODID:LibPST v[^\n]*$", normalized):
+        return content, []
+
+    ignored: list[str] = []
+    lines: list[str] = []
+    for line in normalized.split("\n"):
+        if line.upper().startswith("DTSTAMP:"):
+            lines.append("DTSTAMP:<LIBPST-CONVERSION-TIME>")
+            ignored.append("DTSTAMP")
+        else:
+            lines.append(line)
+    return "\n".join(lines).encode("utf-8"), sorted(set(ignored))
 
 
 def _replace_unicode_surrogates(value: str) -> tuple[str, int]:
@@ -353,6 +384,7 @@ def _write_attachments(
     parts: Iterable[Message], output_dir: Path, email_id: str
 ) -> list[dict[str, object]]:
     records: list[dict[str, object]] = []
+    calendar_candidates: list[tuple[int, str, list[str], bool, bool]] = []
     used_names: set[str] = set()
     message_dir = output_dir / "attachments" / email_id
 
@@ -364,19 +396,117 @@ def _write_attachments(
         destination = message_dir / saved_name
         destination.write_bytes(content)
         relative_path = destination.relative_to(output_dir).as_posix()
+        content_type = part.get_content_type()
+        raw_sha256 = _sha256_bytes(content)
+        if content_type.lower() == "text/calendar":
+            semantic_content, ignored_properties = _normalize_libpst_calendar(content)
+            if ignored_properties:
+                generated_filename = bool(
+                    original_name
+                    and re.fullmatch(r"i\d+\.ics", original_name, flags=re.IGNORECASE)
+                )
+                calendar_candidates.append(
+                    (
+                        len(records),
+                        _sha256_bytes(semantic_content),
+                        ignored_properties,
+                        generated_filename,
+                        original_name is None,
+                    )
+                )
+
         records.append(
             {
                 "original_filename": original_name,
                 "saved_filename": saved_name,
                 "path": relative_path,
-                "content_type": part.get_content_type(),
+                "content_type": content_type,
                 "content_disposition": part.get_content_disposition(),
                 "content_id": str(part.get("Content-ID", "")) or None,
                 "size_bytes": len(content),
-                "sha256": _sha256_bytes(content),
+                "sha256": raw_sha256,
+                "semantic_sha256": raw_sha256,
+                "semantic_normalization": None,
             }
         )
+
+    candidate_groups: dict[str, list[tuple[int, list[str], bool, bool]]] = {}
+    for index, semantic_sha256, ignored, generated_filename, unnamed in calendar_candidates:
+        candidate_groups.setdefault(semantic_sha256, []).append(
+            (index, ignored, generated_filename, unnamed)
+        )
+    for semantic_sha256, candidates in candidate_groups.items():
+        if not (
+            len(candidates) >= 2
+            and any(item[2] for item in candidates)
+            and any(item[3] for item in candidates)
+        ):
+            continue
+        for index, ignored, generated_filename, _unnamed in candidates:
+            records[index]["semantic_sha256"] = semantic_sha256
+            records[index]["semantic_normalization"] = {
+                "type": "libpst_generated_calendar_pair_v1",
+                "ignored_properties": ignored,
+                "generated_filename": generated_filename,
+                "detection": "matching inline and generated-filename calendar parts",
+            }
     return records
+
+
+def _semantic_message_sha256(record: dict[str, object]) -> str:
+    structural_headers = {
+        "content-type",
+        "content-transfer-encoding",
+        "mime-version",
+    }
+    headers = record.get("headers", [])
+    assert isinstance(headers, list)
+    semantic_headers = sorted(
+        (
+            str(item.get("name", "")).casefold(),
+            _clean_text(str(item.get("value", ""))),
+        )
+        for item in headers
+        if isinstance(item, dict)
+        and str(item.get("name", "")).casefold() not in structural_headers
+    )
+
+    attachments = record.get("attachments", [])
+    assert isinstance(attachments, list)
+    semantic_attachments: list[dict[str, object]] = []
+    for item in attachments:
+        assert isinstance(item, dict)
+        normalization = item.get("semantic_normalization")
+        generated_filename = bool(
+            isinstance(normalization, dict)
+            and normalization.get("generated_filename")
+        )
+        semantic_attachments.append(
+            {
+                "filename": None if generated_filename else item.get("original_filename"),
+                "content_type": item.get("content_type"),
+                "content_disposition": item.get("content_disposition"),
+                "content_id": item.get("content_id"),
+                "semantic_sha256": item.get("semantic_sha256"),
+            }
+        )
+
+    payload = {
+        "subject": record.get("subject"),
+        "from": record.get("from"),
+        "to": record.get("to"),
+        "cc": record.get("cc"),
+        "bcc": record.get("bcc"),
+        "reply_to": record.get("reply_to"),
+        "date": record.get("date"),
+        "message_id": record.get("message_id"),
+        "in_reply_to": record.get("in_reply_to"),
+        "references": record.get("references"),
+        "body": record.get("body"),
+        "attachments": semantic_attachments,
+        "headers": semantic_headers,
+    }
+    return _canonical_sha256(payload)
 
 
 def _message_record(
@@ -390,7 +520,7 @@ def _message_record(
 ) -> dict[str, object]:
     message = BytesParser(policy=policy.default).parsebytes(raw)
     relative_posix = relative_path.as_posix()
-    email_id = _email_id(raw, relative_path, source_id)
+    email_id = _email_id(relative_path, source_id)
     plain_parts, html_parts, attachment_parts = _classify_parts(message)
     html_body = _clean_text("\n\n".join(part for part in html_parts if part))
     text_body = _clean_text("\n\n".join(part for part in plain_parts if part))
@@ -410,6 +540,19 @@ def _message_record(
         {"name": str(name), "value": str(value)}
         for name, value in message.raw_items()
     ]
+    normalized_calendar_attachments = sum(
+        bool(item.get("semantic_normalization")) for item in attachment_records
+    )
+    warnings: list[dict[str, object]] = []
+    if normalized_calendar_attachments:
+        warnings.append(
+            {
+                "type": "libpst_generated_calendar_artifacts_normalized",
+                "attachment_count": normalized_calendar_attachments,
+                "raw_values_preserved": True,
+            }
+        )
+
     record: dict[str, object] = {
         "schema_version": SCHEMA_VERSION,
         "id": email_id,
@@ -434,18 +577,21 @@ def _message_record(
         "body": body,
         "attachments": attachment_records,
         "headers": headers,
-        "warnings": [],
+        "warnings": warnings,
     }
     sanitized_record, replacements = _sanitize_record_value(record)
     assert isinstance(sanitized_record, dict)
     if replacements:
-        sanitized_record["warnings"] = [
+        sanitized_warnings = sanitized_record["warnings"]
+        assert isinstance(sanitized_warnings, list)
+        sanitized_warnings.append(
             {
                 "type": "invalid_unicode_replaced",
                 "replacement_count": replacements,
                 "replacement_character": "U+FFFD",
             }
-        ]
+        )
+    sanitized_record["semantic_sha256"] = _semantic_message_sha256(sanitized_record)
     return sanitized_record
 
 
@@ -531,11 +677,9 @@ def _extract_pst(
 ) -> None:
     executable = _readpst_executable()
 
-    command = [executable, "-e", "-8", "-q", "-t", "e"]
+    command = [executable, "-e", "-8", "-q", "-t", "e", "-j", "0"]
     if options.include_deleted:
         command.append("-D")
-    if options.jobs is not None:
-        command.extend(["-j", str(options.jobs)])
     command.extend(["-o", str(destination), str(pst_path)])
     progress(f"Extracting {pst_path.name} locally...")
     result = subprocess.run(command, capture_output=True, text=True, check=False)
@@ -554,6 +698,20 @@ def _readpst_executable() -> str:
     return executable
 
 
+def _readpst_version_output(executable: str) -> str | None:
+    try:
+        result = subprocess.run(
+            [executable, "-V"],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+    except OSError:
+        return None
+    output = (result.stdout or result.stderr).strip()
+    return output or None
+
+
 def _find_eml_files(root: Path) -> list[Path]:
     return sorted(
         (path for path in root.rglob("*") if path.is_file() and path.suffix.lower() == ".eml"),
@@ -567,15 +725,31 @@ def _copy_eml(raw: bytes, relative_path: Path, output_dir: Path, source_id: str)
     destination.write_bytes(raw)
 
 
-def _source_id(path: Path) -> str:
-    return hashlib.sha256(str(path.resolve()).encode("utf-8")).hexdigest()[:12]
+def _directory_source_fingerprint(path: Path, eml_files: tuple[Path, ...]) -> str:
+    digest = hashlib.sha256()
+    digest.update(b"eml_directory\0")
+    for eml_path in eml_files:
+        relative_path = eml_path.relative_to(path).as_posix()
+        digest.update(relative_path.encode("utf-8", errors="surrogateescape"))
+        digest.update(b"\0")
+        digest.update(_sha256_file(eml_path).encode("ascii"))
+        digest.update(b"\0")
+    return digest.hexdigest()
 
 
 def _source_spec(path: Path, source_type: str, eml_files: tuple[Path, ...] = ()) -> _SourceSpec:
+    source_sha256: str | None = None
+    if path.is_file():
+        source_sha256 = _sha256_file(path)
+        identity = f"{source_type}\0{path.name.casefold()}\0{source_sha256}"
+    else:
+        directory_fingerprint = _directory_source_fingerprint(path, eml_files)
+        identity = f"{source_type}\0{directory_fingerprint}"
     return _SourceSpec(
         path=path,
         source_type=source_type,
-        source_id=_source_id(path),
+        source_id=hashlib.sha256(identity.encode("utf-8")).hexdigest()[:16],
+        source_sha256=source_sha256,
         eml_files=eml_files,
     )
 
@@ -653,6 +827,15 @@ def _expand_sources(sources: Sequence[Path], output_dir: Path) -> list[_SourceSp
             "macOS AppleDouble files beginning with '._' are metadata and are excluded."
         )
 
+    unique_specs: list[_SourceSpec] = []
+    seen_source_ids: set[str] = set()
+    for spec in specs:
+        if spec.source_id in seen_source_ids:
+            continue
+        seen_source_ids.add(spec.source_id)
+        unique_specs.append(spec)
+    specs = unique_specs
+
     managed_roots = [(output_resolved / name).resolve() for name in MANAGED_OUTPUTS]
     for spec in specs:
         resolved = spec.path.resolve()
@@ -670,7 +853,7 @@ def _source_details(spec: _SourceSpec) -> dict[str, object]:
     }
     if spec.path.is_file():
         details["size_bytes"] = spec.path.stat().st_size
-        details["sha256"] = _sha256_file(spec.path)
+        details["sha256"] = spec.source_sha256
     elif spec.eml_files:
         details["file_count"] = len(spec.eml_files)
         details["size_bytes"] = sum(path.stat().st_size for path in spec.eml_files)
@@ -724,12 +907,26 @@ def export_sources(
 
     if not options.formats or not options.formats.issubset({"jsonl", "markdown"}):
         raise ExportError("Formats must include jsonl, markdown, or both.")
-    if options.jobs is not None and options.jobs < 0:
-        raise ExportError("Jobs must be zero or a positive number.")
+    if options.jobs != 0:
+        raise ExportError(
+            "Unsafe ReadPST parallelism is disabled for evidentiary exports. "
+            "Use --jobs 0; parallelize separate PST files instead."
+        )
 
     specs = _expand_sources(sources, output_dir)
+    readpst_details: dict[str, object] | None = None
     if any(spec.source_type == "pst" for spec in specs):
-        _readpst_executable()
+        readpst_executable = _readpst_executable()
+        readpst_arguments = ["-e", "-8", "-q", "-t", "e", "-j", "0"]
+        if options.include_deleted:
+            readpst_arguments.append("-D")
+        readpst_details = {
+            "name": "readpst",
+            "version_output": _readpst_version_output(readpst_executable),
+            "parallel_jobs": 0,
+            "mode": "serial",
+            "arguments": readpst_arguments,
+        }
     _prepare_output(output_dir, options.overwrite)
     started_at = datetime.now(timezone.utc)
 
@@ -745,7 +942,8 @@ def export_sources(
         }
         for spec in specs
     }
-    first_content_ids: dict[str, str] = {}
+    first_semantic_content_ids: dict[str, str] = {}
+    raw_content_hashes: set[str] = set()
     message_count = 0
     message_failures = 0
     source_failures = 0
@@ -754,6 +952,7 @@ def export_sources(
     attachment_bytes = 0
     messages_with_unicode_replacements = 0
     unicode_replacement_characters = 0
+    attachments_with_semantic_normalization = 0
     date_values: list[str] = []
 
     jsonl_stream = None
@@ -800,8 +999,12 @@ def export_sources(
                                         unicode_replacement_characters += int(
                                             warning.get("replacement_count", 0)
                                         )
-                            content_hash = str(record["content_sha256"])
-                            record["duplicate_of"] = first_content_ids.get(content_hash)
+                            attachments = record["attachments"]
+                            assert isinstance(attachments, list)
+                            semantic_hash = str(record["semantic_sha256"])
+                            record["duplicate_of"] = first_semantic_content_ids.get(
+                                semantic_hash
+                            )
 
                             if options.keep_eml:
                                 _copy_eml(raw, relative_path, output_dir, spec.source_id)
@@ -817,11 +1020,19 @@ def export_sources(
                                 markdown_path = output_dir / "markdown" / f"{record['id']}.md"
                                 markdown_path.write_text(_markdown(record), encoding="utf-8")
 
-                            first_content_ids.setdefault(content_hash, str(record["id"]))
+                            first_semantic_content_ids.setdefault(
+                                semantic_hash, str(record["id"])
+                            )
+                            raw_content_hashes.add(str(record["content_sha256"]))
+                            attachments_with_semantic_normalization += sum(
+                                bool(
+                                    isinstance(item, dict)
+                                    and item.get("semantic_normalization")
+                                )
+                                for item in attachments
+                            )
                             message_count += 1
                             stats["messages_exported"] = int(stats["messages_exported"]) + 1
-                            attachments = record["attachments"]
-                            assert isinstance(attachments, list)
                             attachment_count += len(attachments)
                             attachment_bytes += sum(
                                 int(item["size_bytes"]) for item in attachments
@@ -838,7 +1049,7 @@ def export_sources(
                             if date_info["utc"]:
                                 date_values.append(str(date_info["utc"]))
                         except Exception as exc:
-                            failed_id = _email_id(raw, relative_path, spec.source_id)
+                            failed_id = _email_id(relative_path, spec.source_id)
                             shutil.rmtree(
                                 output_dir / "attachments" / failed_id, ignore_errors=True
                             )
@@ -919,6 +1130,13 @@ def export_sources(
     manifest: dict[str, object] = {
         "schema_version": SCHEMA_VERSION,
         "generator": {"name": "pst-ai-exporter", "version": __version__},
+        "identity_profiles": {
+            "source": "source-type-name-content-v1",
+            "message": "source-id-and-source-item-v1",
+            "semantic_message": "parsed-evidence-content-v1",
+            "libpst_calendar": "matching-generated-calendar-pair-v1",
+        },
+        "pst_reader": readpst_details,
         "status": "complete" if not errors else "complete_with_errors",
         "started_at": started_at.isoformat(),
         "finished_at": finished_at.isoformat(),
@@ -929,6 +1147,7 @@ def export_sources(
             "include_html": options.include_html,
             "keep_eml": options.keep_eml,
             "include_deleted": options.include_deleted,
+            "jobs": options.jobs,
         },
         "counts": {
             "sources": len(specs),
@@ -936,10 +1155,15 @@ def export_sources(
             "messages_found": messages_found,
             "messages_exported": message_count,
             "messages_failed": message_failures,
-            "unique_message_content": len(first_content_ids),
-            "exact_duplicate_messages": message_count - len(first_content_ids),
+            "unique_message_content": len(first_semantic_content_ids),
+            "exact_duplicate_messages": message_count
+            - len(first_semantic_content_ids),
+            "unique_raw_message_content": len(raw_content_hashes),
             "attachments": attachment_count,
             "attachment_bytes": attachment_bytes,
+            "attachments_with_semantic_normalization": (
+                attachments_with_semantic_normalization
+            ),
             "messages_with_unicode_replacements": messages_with_unicode_replacements,
             "unicode_replacement_characters": unicode_replacement_characters,
         },

@@ -47,7 +47,11 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--jobs",
         type=int,
-        help="Maximum parallel PST extraction jobs (readpst option)",
+        default=0,
+        help=(
+            "ReadPST worker count; evidentiary exports require 0 to disable "
+            "unstable internal parallelism (default: 0)"
+        ),
     )
     parser.add_argument(
         "--overwrite",
