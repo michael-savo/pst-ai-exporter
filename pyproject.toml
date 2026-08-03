@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "pst-ai-exporter"
-version = "0.3.0"
+version = "0.3.1"
 description = "Local PST, MBOX, and EML exporter for AI analysis"
 readme = "README.md"
 requires-python = ">=3.10"
@@ -14,6 +14,7 @@ dependencies = []
 
 [project.scripts]
 pst-ai-exporter = "pst_ai_exporter.cli:main"
+pst-ai-exporter-batch = "pst_ai_exporter.batch:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]

@@ -109,6 +109,25 @@ messages and attachments produced from the same PST. When higher throughput is
 needed, run separate PST files as independent serial jobs and preserve each
 job's manifest before combining them.
 
+For a large collection, the batch command automates that safe arrangement. It
+hashes and inventories every real PST, ignores AppleDouble sidecars, runs four
+separate serial exports at a time, writes a log and manifest for each source,
+and maintains an atomic `batch-manifest.json`. A repeated command skips verified
+complete exports and retries incomplete batch-managed outputs:
+
+```bash
+pst-ai-exporter-batch \
+  "/mnt/d/USC-Uber/input/Ed Telmany" \
+  --output "/mnt/d/USC-Uber/output/Ed_Telmany_Canonical_v031" \
+  --logs "/mnt/d/USC-Uber/logs/Ed_Telmany_Canonical_v031" \
+  --workers 4
+```
+
+`--workers` controls the number of separate PSTs processed concurrently. Every
+individual ReadPST invocation still uses `-j 0`. Each source remains a separate
+export under `by_source/`; downstream database ingestion should read all of
+those source manifests rather than treating them as one combined export.
+
 Choose a new output directory for every evidentiary run. Do not use
 `--overwrite` on a preserved export.
 
